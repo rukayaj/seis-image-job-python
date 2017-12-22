@@ -33,17 +33,7 @@ not_on_transcribe['id'] = not_on_transcribe['id'].astype(int)  # Odd formatting 
 print('Not on transcribe: {}'.format(len(not_on_transcribe)))
 
 # Find the seis file path - we are assuming there is only 1 path we can find
-def find_seis_file_path(image_id):
-    file_paths = glob.glob('{}/**/orig_{}.ims'.format(st.seis_img_dir, image_id), recursive=True)
-    if len(file_paths) == 1:
-        return file_paths[0]
-    else:
-        import pdb; pdb.set_trace()
-not_on_transcribe['seis_file_path'] = not_on_transcribe['id'].apply(find_seis_file_path)
-
-# Construct file paths
-# not_on_transcribe['transcribe_file_path'] = not_on_transcribe.apply(lambda row: path.join(st.transcribe_img_dir, row['institute'].replace(' ', '_'), row['family'].replace(' ', '_'), row['img']))
-# not_on_transcribe['transcribe_web_path'] = not_on_transcribe.apply(lambda row: '/'.join(st.seis_image_server_dir, row['institute'].replace(' ', '_'), row['family'].replace(' ', '_'), row['img']))
+not_on_transcribe['seis_file_path'] = not_on_transcribe['id'].apply(lambda x: glob.glob('{}/**/orig_{}.ims'.format(st.seis_img_dir, x), recursive=True)[0])
 
 # Construct the file paths and copy the files over
 def copy_files_to_transcribe(row):
@@ -97,29 +87,6 @@ insert_multimedia_sql = """insert into multimedia (id, created, file_path, file_
 #    df.to_sql('db_table2', engine, if_exists='append')
 
 
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
     
 # Close database connections
 transcribe_conn.close()
