@@ -1,8 +1,9 @@
 select 
+	ims_document.ims_id as 'id',
 	ims_document.ims_upload_date as 'upload_date', 
 	ims_document.ims_name as 'img', 
 	childFolder.ims_name as 'family', 
-	parentFolder.ims_name as institute
+	parentFolder.ims_name as 'institute'
 from ims_document
 	inner join ims_folder folder on ims_document.ims_folder = folder.ims_id
 	inner join ims_folder_add_lang childFolder on folder.ims_id = childFolder.ims_folder

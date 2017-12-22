@@ -12,3 +12,5 @@ settings.py
 # Output files
 output/
 output/*
+test/
+test/*
