@@ -6,7 +6,7 @@ import settings as st
 from PIL import Image
 from resizeimage import resizeimage
 from pathlib import Path
-from os import path
+from os import path as ospath
 
 # Create database connections
 seis_conn = pymssql.connect(server=st.seis_server, user=st.seis_user, password=st.seis_password, port=st.seis_port, database=st.seis_database) 
@@ -21,51 +21,54 @@ with open('seis.sql', 'r') as seis_sql_file, open('transcribe.sql', 'r') as tran
 seis_df = pd.read_sql(seis_sql, seis_conn)
 transcribe_df = pd.read_sql(transcribe_sql, transcribe_conn)
 seis_conn.close()
-transcribe_conn.close()
 
 # Transcribe expedition names map to families, but we need to remove the numbers in the expedition names to match it up correctly
-transcribe_df['family'] = transcribe_df['expedition'].str.extract('^([A-Z][a-z]+)')
+transcribe_df['family'] = transcribe_df['expedition'].str.extract('^([A-Z][a-z]+)', expand=False)
 
 # Join the two tables on institute, family and image name, and then get a list of all seis images which are not on transcribe
 merged_df = pd.merge(seis_df, transcribe_df, how='outer', on=['institute', 'family', 'img'], suffixes=('_seis', '_transcribe'))
-not_on_transcribe = merged_df.loc[merged_df['expedition'].isnull()]
-not_on_transcribe['id'] = not_on_transcribe['id'].astype(int)  # Odd formatting issue
+not_on_transcribe = merged_df.loc[merged_df['expedition'].isnull() & merged_df['id'].notnull()].copy()
+not_on_transcribe['id'] = not_on_transcribe.loc[:, 'id'].astype(int)  # Odd formatting issue
 print('Not on transcribe: {}'.format(len(not_on_transcribe)))
 
-# Find the seis file path - we are assuming there is only 1 path we can find
-not_on_transcribe['seis_file_path'] = not_on_transcribe['id'].apply(lambda x: glob.glob('{}/**/orig_{}.ims'.format(st.seis_img_dir, x), recursive=True)[0])
+# Find the file path for the corresponding seis image using glob - we are assuming there is only 1 path we can find
+not_on_transcribe['seis_file_path'] = not_on_transcribe['id'].apply(lambda x: glob.glob('{}/**/orig_{}.ims'.format(st.seis_img_dir, x), recursive=True)).str[0]
+df = not_on_transcribe.loc[not_on_transcribe['seis_file_path'].notnull()]  # Drop all the records where we can't find an image to copy
+
+# Get institute details in a separate dataframe and join it into the insert dataframe
+institute_ids_sql = 'select id as "institute_id", name as "institute" from institution where name in ' + str(tuple(df['institute'].unique())) # RUKAYA currently try and join this so it doesn't break when there's only 1 institute
+institutes = pd.read_sql(institute_ids_sql, transcribe_conn)
+df = pd.merge(df, institutes, how='left', on='institute')  # Join it onto the insert dataframe to get institution ids
+transcribe_conn.close()
 
 # Construct the file paths and copy the files over
 def copy_files_to_transcribe(row):
     institute = row['institute'].replace(' ', '_')
     family = row['family'].replace(' ', '_')
-    transcribe_file_path = path.join(st.transcribe_img_dir, institute, family, row['img'])
-    transcribe_web_path = '/'.join(st.seis_image_server_dir, institute, family, row['img'])
-    
-    if Path(row['seis_file_path']).is_file():  # If the SEIS file doesn't exist for some odd reason
-        return False
+    transcribe_file_path = ospath.join(st.transcribe_img_dir, institute, family, row['img'])
+    transcribe_web_path = '/'.join([st.seis_image_server_dir, institute, family, row['img']])
+    try:
+        if Path(row['seis_file_path']).is_file():  # If the SEIS file doesn't exist for some odd reason
+            return False
 
-    if not Path(transcribe_file_path).is_file():  # If the transcribe file already exists don't copy it
-        return transcribe_web_path
-    
-    with Image.open(row['seis_file_path']) as image:  # Save the image
-        new_image = resizeimage.resize_contain(image, [st.max_width, st.max_height])
-        img.save(transcribe_file_path, image.format)
-        return transcribe_web_path
-not_on_transcribe['web_path'] = not_on_transcribe.apply(copy_files_to_transcribe)
+        if not Path(transcribe_file_path).is_file():  # If the transcribe file already exists don't copy it
+            return transcribe_web_path
+        
+        with Image.open(row['seis_file_path']) as image:  # Save the image
+            new_image = resizeimage.resize_contain(image, [st.max_width, st.max_height])
+            img.save(transcribe_file_path, image.format)
+            return transcribe_web_path
+    except: 
+        import pdb; pdb.set_trace()
+df['web_path'] = df.apply(copy_files_to_transcribe, axis=1)
 
-# Discard all transcribe tasks which have already been inserted into the database - no idea why I have to do this but shaun does it
+import pdb; pdb.set_trace()
+# Discard all transcribe tasks which have already been inserted into the database - no idea why this might occur but shaun does it
 exists_sql = 'select exists(select 1 from multimedia where file_path = ?)'
-not_on_transcribe['on_transcribe'] = not_on_transcribe['web_path'].apply(lambda x: pd.read_sql(exists_sql, x, transcribe_conn))
-insert = not_on_transcribe.loc[not_on_transcribe['on_transcribe'] == False]
-if insert.empty:
+df['on_transcribe'] = df['web_path'].apply(lambda x: pd.read_sql(exists_sql, x, transcribe_conn))
+insert = df.loc[df['on_transcribe'] == False]
+if insert.empty:  # If there's nothing to insert stop the script
     exit()
-
-# Get institute details in a separate dataframe and join it into the insert dataframe
-institute_names = tuple(insert['institute'].unique())
-institute_ids_sql = "select id as 'institute_id', name as 'institute' from institution where name in ({1})".format('?', ','.join('?' + len(institute_names)))  # Construct SQL
-institutes = pd.read_sql(institute_ids_sql, transcribe_conn, institute_names)
-insert = pd.merge(insert, institutes, how='left', on='institute')  # Join it onto the insert dataframe to get institution ids
 
 # Get project/expedition with less than st.transcribe_expedition_size 
 # If there isn't a suitable one then create one
