@@ -5,8 +5,7 @@ import glob
 import settings as st
 from PIL import Image
 from resizeimage import resizeimage
-from pathlib import Path
-from os import path as ospath
+import os
 
 # Create database connections
 seis_conn = pymssql.connect(server=st.seis_server, user=st.seis_user, password=st.seis_password, port=st.seis_port, database=st.seis_database) 
@@ -36,41 +35,52 @@ not_on_transcribe['seis_file_path'] = not_on_transcribe['id'].apply(lambda x: gl
 df = not_on_transcribe.loc[not_on_transcribe['seis_file_path'].notnull()]  # Drop all the records where we can't find an image to copy
 
 # Get institute details in a separate dataframe and join it into the insert dataframe
-institute_ids_sql = 'select id as "institute_id", name as "institute" from institution where name in ' + str(tuple(df['institute'].unique())) # RUKAYA currently try and join this so it doesn't break when there's only 1 institute
-institutes = pd.read_sql(institute_ids_sql, transcribe_conn)
+institutes_string = ', '.join("'" + elem + "'" for elem in df['institute'].unique())
+institutes = pd.read_sql('select id as "institute_id", name as "institute" from institution where name in (' + institutes_string + ')', transcribe_conn)
 df = pd.merge(df, institutes, how='left', on='institute')  # Join it onto the insert dataframe to get institution ids
-transcribe_conn.close()
 
 # Construct the file paths and copy the files over
 def copy_files_to_transcribe(row):
     institute = row['institute'].replace(' ', '_')
     family = row['family'].replace(' ', '_')
-    transcribe_file_path = ospath.join(st.transcribe_img_dir, institute, family, row['img'])
-    transcribe_web_path = '/'.join([st.seis_image_server_dir, institute, family, row['img']])
+    jpeg_file_name = os.path.splitext(row['img'])[0] + '.jpg'  # add jpg file extension so PIL knows to save it as jpg   
+    transcribe_web_path = '/'.join([st.seis_image_server_dir, institute, family, jpeg_file_name])
+    
+    # Construct the physical file path and create the directory if required
+    transcribe_path = os.path.join(st.transcribe_img_dir, institute, family)
+    if not os.path.exists(transcribe_path):
+        os.makedirs(transcribe_path)
+    transcribe_file_path = os.path.join(transcribe_path, jpeg_file_name)
+    
     try:
-        if Path(row['seis_file_path']).is_file():  # If the SEIS file doesn't exist for some odd reason
+        if not os.path.isfile(row['seis_file_path']):  # If the SEIS file doesn't exist for some odd reason
             return False
 
-        if not Path(transcribe_file_path).is_file():  # If the transcribe file already exists don't copy it
+        if os.path.isfile(transcribe_file_path):  # If the transcribe file already exists don't copy it
             return transcribe_web_path
         
-        with Image.open(row['seis_file_path']) as image:  # Save the image
-            new_image = resizeimage.resize_contain(image, [st.max_width, st.max_height])
-            img.save(transcribe_file_path, image.format)
+        with Image.open(row['seis_file_path']) as image:  # Resize and save a new image
+            new_image = resizeimage.resize_thumbnail(image, [st.max_width, st.max_height])
+            new_image.save(transcribe_file_path)
             return transcribe_web_path
     except: 
         import pdb; pdb.set_trace()
 df['web_path'] = df.apply(copy_files_to_transcribe, axis=1)
 
-import pdb; pdb.set_trace()
 # Discard all transcribe tasks which have already been inserted into the database - no idea why this might occur but shaun does it
-exists_sql = 'select exists(select 1 from multimedia where file_path = ?)'
-df['on_transcribe'] = df['web_path'].apply(lambda x: pd.read_sql(exists_sql, x, transcribe_conn))
+cur = transcribe_conn.cursor()
+exists_sql = "select exists(select 1 from multimedia where file_path = %s)"  # Perhaps faster to retrieve entire multimedia table and do a join in pandas?
+def check_exists(web_path):
+    cur.execute(exists_sql, [web_path])
+    return cur.fetchone()[0]
+df['on_transcribe'] = df['web_path'].apply(check_exists)
 insert = df.loc[df['on_transcribe'] == False]
+import pdb; pdb.set_trace()
 if insert.empty:  # If there's nothing to insert stop the script
     exit()
 
 # Get project/expedition with less than st.transcribe_expedition_size 
+select_project_sql = """select """
 # If there isn't a suitable one then create one
 create_project_sql = """insert into project (id, version, created, featured_label, inactive, institution_id, map_init_latitude, map_init_longitude, 
                                             map_init_zoom_level, name, project_type_id, show_map) 
