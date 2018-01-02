@@ -52,54 +52,59 @@ def copy_files_to_transcribe(row):
         os.makedirs(transcribe_path)
     transcribe_file_path = os.path.join(transcribe_path, jpeg_file_name)
     
-    try:
-        if not os.path.isfile(row['seis_file_path']):  # If the SEIS file doesn't exist for some odd reason
-            return False
-
-        if os.path.isfile(transcribe_file_path):  # If the transcribe file already exists don't copy it
-            return transcribe_web_path
+    if not os.path.isfile(row['seis_file_path']):  # If the SEIS file doesn't exist for some odd reason
+        return False
+    if os.path.isfile(transcribe_file_path):  # If the transcribe file already exists don't copy it
+        return transcribe_web_path
         
-        with Image.open(row['seis_file_path']) as image:  # Resize and save a new image
-            new_image = resizeimage.resize_thumbnail(image, [st.max_width, st.max_height])
-            new_image.save(transcribe_file_path)
-            return transcribe_web_path
-    except: 
-        import pdb; pdb.set_trace()
+    with Image.open(row['seis_file_path']) as image:  # Resize and save a new image
+        new_image = resizeimage.resize_thumbnail(image, [st.max_width, st.max_height])
+        new_image.save(transcribe_file_path)
+        return transcribe_web_path
 df['web_path'] = df.apply(copy_files_to_transcribe, axis=1)
 
-# Discard all transcribe tasks which have already been inserted into the database - no idea why this might occur but shaun does it
-cur = transcribe_conn.cursor()
-exists_sql = "select exists(select 1 from multimedia where file_path = %s)"  # Perhaps faster to retrieve entire multimedia table and do a join in pandas?
-def check_exists(web_path):
-    cur.execute(exists_sql, [web_path])
-    return cur.fetchone()[0]
-df['on_transcribe'] = df['web_path'].apply(check_exists)
-insert = df.loc[df['on_transcribe'] == False]
-import pdb; pdb.set_trace()
-if insert.empty:  # If there's nothing to insert stop the script
+# Check to see if the tasks have already been inserted into the multimedia table in the transcribe db - Shaun did this for some reason
+tr_multimedia = pd.read_sql('select file_path as task_on_transcribe from multimedia', transcribe_conn)
+df = pd.merge(df, tr_multimedia, how='left', left_on='web_path', right_on='task_on_transcribe') 
+for_insert = df.loc[df['task_on_transcribe'].isnull()]
+if for_insert.empty:  # If there's nothing to insert stop the script
     exit()
 
-# Get project/expedition with less than st.transcribe_expedition_size 
-select_project_sql = """select """
-# If there isn't a suitable one then create one
-create_project_sql = """insert into project (id, version, created, featured_label, inactive, institution_id, map_init_latitude, map_init_longitude, 
-                                            map_init_zoom_level, name, project_type_id, show_map) 
-                        values ((select max(id)+1 from project), 0, current_date, ?, TRUE, ?, '-57.4023613632533', '176.396484625', 1, ?, 7134, FALSE)"""
-# values: expedition name, institution id, expedition name
-
-
-# Seperate the dbf into blocks one block of len(for_transcribe_insertion) and blocks of st.transcribe_expedition_size
-# Or insert one by one and check for a project/expedition each time (this will be slower but the code will be simpler)
-
-insert_task_sql = 'insert into task (id, created, external_identifier, project_id) values ((select max(id)+1 from task), current_timestamp, ?, ?)'
-insert_multimedia_sql = """insert into multimedia (id, created, file_path, file_path_to_thumbnail, mime_type, task_id) 
-                           values ((select max(id)+1 from multimedia), current_date, ?, ?, 'image/jpeg', ?)"""
-
-# Haven't included this in the above function as I have a hunch it will be much faster this way
-# def insert_transcribe_database_records(row):
-#    df.to_sql('db_table2', engine, if_exists='append')
-
-
+# Two functions below to insert a transcribe task + multimedia (which calls get_or_create_project first)
+cur = transcribe_conn.cursor()
+def get_or_create_project(institution_id, family):
+    select_project_sql = """SELECT project.id, featured_label, count(task.project_id) AS task_count 
+                            FROM project LEFT JOIN task ON task.project_id = project.id 
+                            WHERE featured_label LIKE %s GROUP BY project.id ORDER BY length(featured_label) DESC, featured_label DESC"""
+    projects = pd.read_sql(select_project_sql, transcribe_conn, params=[family + '%'])
+        
+    if not projects.empty:
+        if projects.iloc[0]['task_count'] < st.transcribe_expedition_size:  # If there's a suitable expedition not full of tasks, return that project id 
+            return projects.iloc[0]['id']
     
+    new_expedition_name = family + ' ' + str(len(projects) + 1)  # Otherwise make a new expedition/project and return the id
+    insert_project_sql = """INSERT INTO project(featured_label, institution_id, name, inactive, project_type_id, show_map, created, id)
+                            VALUES (%s, %s, %s, TRUE, 7134, FALSE, CURRENT_DATE, (SELECT MAX(id)+1 FROM project)) RETURNING id"""
+    cur.execute(insert_project_sql, [new_expedition_name, institution_id, new_expedition_name])
+    return cur.fetchone()[0]  # id of newly inserted row
+    
+def insert_transcription_task(row):
+    project_id = get_or_create_project(row['institute_id'], row['family'])
+    
+    # Insert the task
+    insert_task_sql = 'INSERT INTO task (id, created, external_identifier, project_id) VALUES ((SELECT MAX(id)+1 FROM task), current_timestamp, %s, %s) RETURNING id'
+    cur.execute(insert_task_sql, [row['img'], int(project_id)])
+    task_id = cur.fetchone()[0] 
+    
+    # Insert the multimedia
+    insert_multimedia_sql = """INSERT INTO multimedia (id, created, mime_type, file_path, file_path_to_thumbnail, task_id) 
+                               VALUES ((SELECT MAX(id)+1 FROM multimedia), current_date, 'image/jpeg', %s, %s, %s) RETURNING id"""
+    cur.execute(insert_multimedia_sql, [row['web_path'], row['web_path'], int(task_id)])
+    
+    return task_id
+for_insert['new_task_id'] = for_insert.apply(insert_transcription_task, axis=1)  # This might be a faster alternative: df.to_sql('db_tablename', engine, if_exists='append')
+   
 # Close database connections
 transcribe_conn.close()
+
+import pdb; pdb.set_trace()
