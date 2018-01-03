@@ -7,32 +7,37 @@ from PIL import Image
 from resizeimage import resizeimage
 import os
 
-# Create database connections
+# Create database connections and read in the initial data
 seis_conn = pymssql.connect(server=st.seis_server, user=st.seis_user, password=st.seis_password, port=st.seis_port, database=st.seis_database) 
-transcribe_conn = psycopg2.connect(host=st.transcribe_server, user=st.transcribe_user, password=st.transcribe_password, database=st.transcribe_database) 
-
-# Load the queries we want to run
-with open('seis.sql', 'r') as seis_sql_file, open('transcribe.sql', 'r') as transcribe_sql_file:
-    seis_sql = seis_sql_file.read()    
-    transcribe_sql = transcribe_sql_file.read()    
-
-# Load the queries into dataframes, add identifier columns and close the seis connection                 
+transcribe_conn = psycopg2.connect(host=st.transcribe_server, user=st.transcribe_user, password=st.transcribe_password, database=st.transcribe_database, port=st.transcribe_port) 
+transcribe_sql = """select task.external_identifier as img, project.name as expedition, institution.name as institute
+                    from task left join project on project.id = task.project_id left join institution on institution.id = project.institution_id"""
+seis_sql = """select ims_document.ims_id as 'id', ims_document.ims_name as 'img', childFolder.ims_name as 'family',
+                ims_document.ims_upload_date as 'upload_date', parentFolder.ims_name as 'institute'
+            from ims_document
+                inner join ims_folder folder on ims_document.ims_folder = folder.ims_id
+                inner join ims_folder_add_lang childFolder on folder.ims_id = childFolder.ims_folder
+                inner join ims_folder_add_lang parentFolder on folder.ims_parent_folder = parentFolder.ims_folder
+            where (select ims_folder.ims_parent_folder from ims_folder where ims_folder.ims_id = parentFolder.ims_folder) = 951"""            
 seis_df = pd.read_sql(seis_sql, seis_conn)
 transcribe_df = pd.read_sql(transcribe_sql, transcribe_conn)
-seis_conn.close()
+seis_conn.close()  # We don't need this one any more, but the transcribe one is used throughout the script
 
 # Transcribe expedition names map to families, but we need to remove the numbers in the expedition names to match it up correctly
 transcribe_df['family'] = transcribe_df['expedition'].str.extract('^([A-Z][a-z]+)', expand=False)
 
 # Join the two tables on institute, family and image name, and then get a list of all seis images which are not on transcribe
-merged_df = pd.merge(seis_df, transcribe_df, how='outer', on=['institute', 'family', 'img'], suffixes=('_seis', '_transcribe'))
+merged_df = pd.merge(seis_df, transcribe_df, how='outer', on=['institute', 'family', 'img'])
 not_on_transcribe = merged_df.loc[merged_df['expedition'].isnull() & merged_df['id'].notnull()].copy()
 not_on_transcribe['id'] = not_on_transcribe.loc[:, 'id'].astype(int)  # Odd formatting issue
-print('Not on transcribe: {}'.format(len(not_on_transcribe)))
+print('Not on transcribe: {}'.format(len(not_on_transcribe))) # not_on_transcribe.to_csv('not_on_transcribe.csv')
+exit()
 
 # Find the file path for the corresponding seis image using glob - we are assuming there is only 1 path we can find
 not_on_transcribe['seis_file_path'] = not_on_transcribe['id'].apply(lambda x: glob.glob('{}/**/orig_{}.ims'.format(st.seis_img_dir, x), recursive=True)).str[0]
 df = not_on_transcribe.loc[not_on_transcribe['seis_file_path'].notnull()]  # Drop all the records where we can't find an image to copy
+if df.empty:
+    exit()
 
 # Get institute details in a separate dataframe and join it into the insert dataframe
 institutes_string = ', '.join("'" + elem + "'" for elem in df['institute'].unique())
@@ -68,9 +73,10 @@ tr_multimedia = pd.read_sql('select file_path as task_on_transcribe from multime
 df = pd.merge(df, tr_multimedia, how='left', left_on='web_path', right_on='task_on_transcribe') 
 for_insert = df.loc[df['task_on_transcribe'].isnull()]
 if for_insert.empty:  # If there's nothing to insert stop the script
+    import pdb; pdb.set_trace()
     exit()
 
-# Two functions below to insert a transcribe task + multimedia (which calls get_or_create_project first)
+# Two functions below to insert a transcribe project and task + multimedia (which calls get_or_create_project first)
 cur = transcribe_conn.cursor()
 def get_or_create_project(institution_id, family):
     select_project_sql = """SELECT project.id, featured_label, count(task.project_id) AS task_count 
@@ -100,11 +106,13 @@ def insert_transcription_task(row):
     insert_multimedia_sql = """INSERT INTO multimedia (id, created, mime_type, file_path, file_path_to_thumbnail, task_id) 
                                VALUES ((SELECT MAX(id)+1 FROM multimedia), current_date, 'image/jpeg', %s, %s, %s) RETURNING id"""
     cur.execute(insert_multimedia_sql, [row['web_path'], row['web_path'], int(task_id)])
+    transcribe_conn.commit()
     
     return task_id
 for_insert['new_task_id'] = for_insert.apply(insert_transcription_task, axis=1)  # This might be a faster alternative: df.to_sql('db_tablename', engine, if_exists='append')
    
 # Close database connections
+transcribe_conn.commit()
 transcribe_conn.close()
 
 import pdb; pdb.set_trace()
