@@ -1,7 +1,7 @@
 certifi==2017.11.5
 chardet==3.0.4
 idna==2.6
-numpy==1.13.3
+numpy==1.22.0
 olefile==0.44
 pandas==0.21.0
 Pillow==4.3.0
